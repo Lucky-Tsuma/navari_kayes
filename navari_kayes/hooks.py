@@ -104,7 +104,7 @@ app_license = "MIT"
 
 doc_events = {
 	"Journal Entry": {
-		"on_cancel": "navari_kayes.controllers.delete_linked_cost_distributions.custom_on_cancel"
+		"on_cancel": "navari_kayes.controllers.cancel_linked_cost_distributions.custom_on_cancel"
 	}
 }
 

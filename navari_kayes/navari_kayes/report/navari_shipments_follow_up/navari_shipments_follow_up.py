@@ -3,6 +3,7 @@
 
 import frappe
 from frappe import _
+from pypika import Criterion
 
 def execute(filters=None):
 	if filters.from_date > filters.to_date:
@@ -92,44 +93,46 @@ def get_columns():
 	];
 
 def get_data(filters):
-	company = filters.get('company');
 	from_date = filters.get('from_date');
 	to_date = filters.get('to_date');
-	purchase_order = filters.get('purchase_order');
-	supplier = filters.get('supplier');
-	customer = filters.get('customer');
-	cost_center = filters.get('cost_center');
 
-	conditions = " AND 1 = 1 ";
+	purchase_order = frappe.qb.DocType("Purchase Order");
+	purchase_order_item = frappe.qb.DocType("Purchase Order Item");
+	sales_order = frappe.qb.DocType("Sales Order");
 
-	if company:
-		conditions += f" AND po.company = '{company}'";
-	if purchase_order:
-		conditions += f" AND po.name = '{purchase_order}'";
-	if supplier:
-		conditions += f" AND  po.supplier = '{supplier}'";
-	if cost_center:
-		conditions += f" AND poi.cost_center = '{cost_center}'";
-	if customer:
-		conditions += f" AND po.customer = '{customer}'";
+	conditions = [purchase_order.transaction_date[from_date:to_date]];
 
-	shipment_details = frappe.db.sql(f"""
-		SELECT po.name as purchase_order,
-			po.supplier as supplier,
-			po.incoterm as shipping_terms_and_method,
-			poi.cost_center as cost_center,
-			poi.description as description,
-			poi.schedule_date as expected_shipping_date,
-			poi.expected_delivery_date as expected_arrival_date,
-			poi.sales_order as sales_order,
-			poi.sales_order_item as sales_order_item,
-			so.customer_address as delivery_place,
-			so.shipping_info as shipping_info
-		FROM `tabPurchase Order` as po
-		INNER JOIN `tabPurchase Order Item` as poi ON po.name = poi.parent
-		LEFT JOIN `tabSales Order` as so ON poi.sales_order = so.name
-		WHERE (po.transaction_date BETWEEN '{from_date}' AND '{to_date}') {conditions}
-	""", as_dict = True);
+	if filters.get('company'):
+		conditions.append(purchase_order.company == filters.get('company'));
+	if filters.get('purchase_order'):
+		conditions.append(purchase_order.name == filters.get('purchase_order'));
+	if filters.get('supplier'):
+		conditions.append(purchase_order.supplier == filters.get('supplier'));
+	if filters.get('cost_center'):
+		conditions.append(purchase_order_item.cost_center == filters.get('cost_center'));
+	if filters.get('customer'):
+		conditions.append(purchase_order.customer == filters.get('customer'));
+
+	query = frappe.qb.from_(purchase_order)\
+		.inner_join(purchase_order_item)\
+		.on(purchase_order.name == purchase_order_item.parent)\
+		.left_join(sales_order)\
+		.on(purchase_order_item.sales_order == sales_order.name)\
+		.select(
+			purchase_order.name.as_("purchase_order"),
+			purchase_order.supplier.as_("supplier"),
+			purchase_order.incoterm.as_("shipping_terms_and_method"),
+			purchase_order_item.cost_center.as_("cost_center"),
+			purchase_order_item.description.as_("description"),
+			purchase_order_item.schedule_date.as_("expected_shipping_date"),
+			purchase_order_item.expected_delivery_date.as_("expected_arrival_date"),
+			purchase_order_item.sales_order.as_("sales_order"),
+			purchase_order_item.sales_order_item.as_("sales_order_item"),
+			sales_order.customer_address.as_("delivery_place"),
+			sales_order.shipping_info.as_("shipping_info")
+		).where(Criterion.all(conditions))
+	
+	shipment_details = query.run(as_dict=True);
 
 	if shipment_details:
 		for row in shipment_details:
