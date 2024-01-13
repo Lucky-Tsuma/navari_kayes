@@ -3,6 +3,7 @@
 
 import frappe
 from frappe import _
+from pypika import Criterion, Case
 
 def execute(filters=None):
 	if filters.from_date > filters.to_date:
@@ -59,13 +60,13 @@ def get_data(filters):
 	first_account_no = frappe.db.get_value('Account', root_account, 'account_number');
 	last_account_no = frappe.db.get_value('Account', to_account, 'account_number') if to_account else None;
 		
-	def is_group(account):
-		return frappe.db.get_value('Account', account, 'is_group');
+	def is_group(account_name):
+		return frappe.db.get_value('Account', account_name, 'is_group');
 
-	def get_pending_accounts(accounts_list):
-		for account in accounts_list:
+	def get_list_of_account_names(list_of_fetched_account_names_starting_from_root):
+		for account in list_of_fetched_account_names_starting_from_root:
 			if is_group(account):
-				insert_index = accounts_list.index(account) + 1;
+				insert_index = list_of_fetched_account_names_starting_from_root.index(account) + 1;
 				child_accounts = None;
 				if last_account_no:
 					child_accounts = frappe.db.get_all('Account', 
@@ -78,48 +79,65 @@ def get_data(filters):
 						filters = { 'root_type': 'Expense', 'parent_account': account, 'account_number': ['>=', first_account_no] }, 
 						pluck = 'name'
 					);
-				accounts_list[ insert_index:insert_index ] = child_accounts;
+				list_of_fetched_account_names_starting_from_root[ insert_index:insert_index ] = child_accounts;
 
-		return accounts_list;
+		return list_of_fetched_account_names_starting_from_root;
 
-	pending_accounts = get_pending_accounts([root_account]);
+	list_of_account_names = get_list_of_account_names([root_account]);
 
-	conditions = " AND gle.docstatus = 1 ";
+	def append_accounts(account_name, indent, from_date, to_date):
+		gl_entry = frappe.qb.DocType("GL Entry");
+		account = frappe.qb.DocType("Account");
 
-	if company:
-		conditions += f" AND gle.company = '{company}'";
-	if cost_center:
-		conditions += f" AND gle.cost_center = '{cost_center}'";
+		def get_conditions():
+			conditions = [gl_entry.docstatus == 1];
 
-	def append_accounts(account, indent, conditions, from_date, to_date, from_account, to_account):
-		conditions += f" AND gle.account LIKE '%{account}'"
-		if is_group(account):
-			parent = None if indent == 0 else frappe.db.get_value('Account', account, 'parent_account');
+			if company:
+				conditions.append(gl_entry.company == company);
+			if cost_center:
+				conditions.append(gl_entry.cost_center == cost_center);
+		
+			return conditions;
 
-			data.append({ 'account': account, 'indent': indent, 'parent': parent, 'debit': 0, 'credit': 0, 'balance': 0 });
+		conditions = get_conditions();
+		conditions.append(gl_entry.account.like(f'{account_name}%'))
+		conditions.append(gl_entry.posting_date[from_date:to_date])
+
+		if is_group(account_name):
+			parent = None if indent == 0 else frappe.db.get_value('Account', account_name, 'parent_account');
+
+			data.append({ 'account': account_name, 'indent': indent, 'parent': parent, 'debit': 0, 'credit': 0, 'balance': 0 });
 		else:
-			gl_entry = frappe.db.sql(f"""
-				SELECT	IFNULL(gle.account, '{account}') as "account",
-						SUM(gle.credit_in_account_currency) as "credit",
-						SUM(gle.debit_in_account_currency) as "debit",
-						SUM(gle.debit_in_account_currency - gle.credit_in_account_currency) as "balance",
-						gle.cost_center as "cost_center",
-						ac.parent_account as "parent"
-				FROM `tabGL Entry` as gle
-				INNER JOIN `tabAccount` as ac
-				ON gle.account = ac.name
-				WHERE (gle.posting_date BETWEEN '{from_date}' AND '{to_date}')  {conditions}
-				""", as_dict = True);
+			sum_credit_in_account_currency = frappe.qb.functions("SUM", gl_entry.credit_in_account_currency).as_("credit")
+			sum_debit_in_account_currency = frappe.qb.functions("SUM", gl_entry.debit_in_account_currency).as_("debit")
+			sum_balance = frappe.qb.functions("SUM", gl_entry.debit_in_account_currency - gl_entry.credit_in_account_currency).as_("balance")
 
-			if gl_entry:
-				gl_entry = gl_entry[0];
-				gl_entry['indent'] = indent;
+			query = frappe.qb.from_(gl_entry)\
+				.inner_join(account)\
+				.on(gl_entry.account == account.name)\
+				.select(
+					Case()
+					.when(gl_entry.account.isnull(), account_name)
+					.else_(gl_entry.account)
+					.as_("account"),
+					sum_credit_in_account_currency,
+					sum_debit_in_account_currency,
+					sum_balance,
+					gl_entry.cost_center.as_("cost_center"),
+					account.parent_account.as_("parent")
+				).where(Criterion.all(conditions))
+			
+			gl_entry_record = query.run(as_dict=True);
+
+			if gl_entry_record:
+				gl_entry_record = gl_entry_record[0];
+				gl_entry_record['indent'] = indent;
 				
-				data.append(gl_entry);
+				data.append(gl_entry_record);
 
 				# fill credit, debit and balance for all parent accounts on the tree.
 				if indent > 0:
-					child_row = gl_entry;
+					child_row = gl_entry_record;
 					parent_account = child_row['parent'];
 
 					while parent_account:
@@ -133,14 +151,14 @@ def get_data(filters):
 
 							parent_account = totals_row['parent'];
 
-	for account in pending_accounts:
-		parent_account = frappe.db.get_value('Account', account, 'parent_account');
+	for account_name in list_of_account_names:
+		parent_account = frappe.db.get_value('Account', account_name, 'parent_account');
 
 		parent_row = list(filter(lambda x: x['account'] == parent_account, data));
 
 		indent = (parent_row[0]['indent']) + 1 if parent_row else 0;
 
-		append_accounts(account, indent, conditions, from_date, to_date, from_account, to_account);
+		append_accounts(account_name, indent, from_date, to_date);
 
 	if not show_zero_values:
 		data = list(filter(lambda x: x['balance'], data));
